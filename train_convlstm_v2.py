@@ -123,12 +123,13 @@ class MultiTaskConvLSTMv2(nn.Module):
 
     def __init__(self, n_slots=N_SLOTS, n_classes=10, n_future=N_FUTURE, dec_hidden=512,
                  h1_ch=96, h2_ch=128, cls_mode="slot", traj_mode="delta", detach_anchor=False,
-                 slot_feat=False, slot_feat_dim=32):
+                 slot_feat=False, slot_feat_dim=32, slot_anchor=False, anchor_dim=32):
         super().__init__()
         assert cls_mode in ("gap", "slot", "clean") and traj_mode in ("abs", "delta")
         self.n_slots, self.n_future = n_slots, n_future
         self.cls_mode, self.traj_mode, self.detach_anchor = cls_mode, traj_mode, detach_anchor
         self.slot_feat = slot_feat
+        self.slot_anchor = slot_anchor
         self.encoder = SpatioTemporalEncoder(h1_ch, h2_ch)
 
         # 轨迹解码器
@@ -137,7 +138,11 @@ class MultiTaskConvLSTMv2(nn.Module):
         self.c0 = nn.Linear(dec_hidden, dec_hidden)
         if slot_feat:  # 每槽位: h1 取样特征 -> slot_feat_dim 维
             self.slot_proj = nn.Sequential(nn.Linear(h1_ch, slot_feat_dim), nn.ReLU())
-        cell_in = n_slots * 2 + (n_slots * slot_feat_dim if slot_feat else 0)
+        if slot_anchor:  # 身份锚: 观测段每槽位"最清晰帧"外观 -> anchor_dim 维 (detach 防污染)
+            self.anchor_proj = nn.Sequential(nn.Linear(h1_ch, anchor_dim), nn.ReLU())
+        cell_in = n_slots * 2
+        cell_in += (n_slots * slot_feat_dim if slot_feat else 0)
+        cell_in += (n_slots * anchor_dim if slot_anchor else 0)
         self.cell = nn.LSTMCell(cell_in, dec_hidden)
         self.pos_out = nn.Sequential(
             nn.Linear(dec_hidden, 256), nn.ReLU(),
@@ -164,12 +169,30 @@ class MultiTaskConvLSTMv2(nn.Module):
                 nn.Linear(128, n_classes),
             )
 
-    def forward(self, video):
+    def forward(self, video, obs_centers=None):
         """video: (B,T,1,64,64) -> logits (B,N,10), traj (B,F+1,N,2), vel (B,N,2)|None.
         traj[:, 0] 是当前帧锚定位置, traj[:, 1:] 是未来 F 帧预测 (均为归一化坐标).
-        vel 仅 cls_mode=clean 时输出: 锚定时刻的瞬时速度估计 (归一化坐标/帧)."""
+        vel 仅 cls_mode=clean 时输出: 锚定时刻的瞬时速度估计 (归一化坐标/帧).
+        obs_centers: (B,T,N,2)|None 观测段每帧每数字质心(归一化, 推理时来自输入视频质心,
+        训练时来自真值), 仅 slot_anchor 需要, 用于在"最清晰帧"取样身份外观锚."""
         h1, h2, h1_seq = self.encoder(video)
         B = video.shape[0]
+
+        # 身份锚: 观测段每槽位在"最清晰帧"(两数字间距最大的帧)取样外观, detach 防梯度污染.
+        id_feat = None
+        if self.slot_anchor and obs_centers is not None:
+            with torch.no_grad():
+                oc = obs_centers.detach()                       # (B,T,N,2) 归一化坐标
+                # 逐帧两数字间距, 选最清晰帧 (间距最大, 最不重叠)
+                dist = (oc[:, :, 0] - oc[:, :, 1]).norm(dim=-1)  # (B,T)
+                best_t = dist.argmax(dim=1)                      # (B,)
+                b_idx = torch.arange(B, device=video.device)
+                anchor_pos = oc[b_idx, best_t]                   # (B,N,2) 最清晰帧位置
+                grid = (anchor_pos * 2 - 1).view(B, self.n_slots, 1, 2)
+                local = F.grid_sample(h1, grid, mode="bilinear",
+                                      padding_mode="border", align_corners=False)
+                local = local.squeeze(-1).permute(0, 2, 1)       # (B,N,C1)
+                id_feat = self.anchor_proj(local).flatten(1)     # (B,N*anchor_dim)
 
         ctx = torch.tanh(self.ctx(h2.flatten(1)))
         h, c = torch.tanh(self.h0(ctx)), torch.tanh(self.c0(ctx))
@@ -177,6 +200,7 @@ class MultiTaskConvLSTMv2(nn.Module):
         preds = []
         vel = None
         for t in range(self.n_future + 1):
+            feat = None
             if self.slot_feat and t > 0:
                 # v4: 在各槽位当前预测位置取样外观特征 (坐标 detach, 防梯度污染)
                 grid = (pos.detach() * 2 - 1).view(B, self.n_slots, 1, 2)
@@ -185,7 +209,12 @@ class MultiTaskConvLSTMv2(nn.Module):
                 feat = self.slot_proj(local.squeeze(-1).permute(0, 2, 1)).flatten(1)
             elif self.slot_feat:
                 feat = video.new_zeros(B, self.n_slots * 32)  # 首步无位置, 零特征
-            inp = torch.cat([pos, feat], dim=1) if self.slot_feat else pos
+            parts = [pos]
+            if feat is not None:
+                parts.append(feat)
+            if id_feat is not None:
+                parts.append(id_feat)
+            inp = torch.cat(parts, dim=1)
             h, c = self.cell(inp, (h, c))
             if t == 0 and self.cls_mode == "clean":
                 vel = self.vel_out(h).view(B, self.n_slots, 2)  # v5: 瞬时速度估计
@@ -226,6 +255,27 @@ class MultiTaskConvLSTMv2(nn.Module):
 
 
 # ---------------- 目标构造与损失 ----------------
+def _load_weights_with_migration(model, state_dict):
+    """加载 checkpoint 权重, 兼容结构扩展 (新增 anchor_proj / cell 输入维扩大).
+
+    - 缺失的层 (如 anchor_proj) 保持随机初始化.
+    - cell.weight_ih 形状扩大时: 旧权重复制到前部对应列, 新增列随机初始化.
+    - 其余 shape 匹配的层用 strict=False 加载.
+    """
+    new_sd = model.state_dict()
+    # 1) 逐键迁移: 形状匹配直接复制; cell 输入维扩大则部分复制
+    for k, v in state_dict.items():
+        if k not in new_sd:
+            continue
+        if new_sd[k].shape == v.shape:
+            new_sd[k] = v
+        elif "cell.weight_ih" in k and new_sd[k].shape[1] > v.shape[1]:
+            # 输入维扩大: 旧列复制到前部, 新增列保持随机初始化
+            new_sd[k][:, :v.shape[1]] = v
+        # 其它形状不匹配的键跳过 (保留随机初始化)
+    model.load_state_dict(new_sd, strict=False)
+
+
 def sort_slots(labels, centers):
     """按首帧质心 x(并列看 y) 排序数字槽位, 使输出顺序有确定含义.
     labels: (B,N), centers: (B,T,N,2) -> 排序后的 labels, centers."""
@@ -273,7 +323,8 @@ def evaluate(model, loader, device, use_amp):
         labels, centers = sort_slots(labels, centers)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            logits, traj, _ = model(video[:, :N_INPUT])
+            obs_centers = (centers[:, :N_INPUT] / CANVAS) if model.slot_anchor else None
+            logits, traj, _ = model(video[:, :N_INPUT], obs_centers)
 
         err = (traj[:, 1:].float() * CANVAS - centers[:, N_INPUT:]).norm(dim=-1)  # (B,F,N) 像素
         ade_sum += err.mean(dim=(1, 2)).sum().item()   # 每条序列先平均, 与基线同口径
@@ -302,7 +353,8 @@ def visualize(model, ds, device, path, n_samples=3):
         labels, centers = sort_slots(labels, centers)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            logits, traj, _ = model(video[:, :N_INPUT])
+            obs_centers = (centers[:, :N_INPUT] / CANVAS) if model.slot_anchor else None
+            logits, traj, _ = model(video[:, :N_INPUT], obs_centers)
         pred = (traj[0, 1:].float() * CANVAS).cpu().numpy()     # (F,N,2)
         pred_cls = logits[0].argmax(-1).cpu().tolist()
         true_cls = labels[0].cpu().tolist()
@@ -341,6 +393,8 @@ def main():
                         help="slot 分类头取样时切断梯度, 防止分类损失带偏锚定位置")
     parser.add_argument("--slot-feat", action="store_true",
                         help="v4: 解码器每步喂槽位级外观特征 (grid_sample h1, 坐标detach)")
+    parser.add_argument("--slot-anchor", action="store_true",
+                        help="v5: 解码器喂观测段'最清晰帧'的身份外观锚 (detach, 维持重叠时身份)")
     parser.add_argument("--h1-ch", type=int, default=96, help="ConvLSTM 第1层通道数")
     parser.add_argument("--h2-ch", type=int, default=128, help="ConvLSTM 第2层通道数")
     parser.add_argument("--dec-hidden", type=int, default=512, help="轨迹解码器隐层宽度")
@@ -369,7 +423,8 @@ def main():
     metrics_path = os.path.join(CKPT_DIR, f"convlstm_{args.tag}_metrics.json")
     fig_path = os.path.join(SAMPLE_DIR, f"traj_convlstm_{args.tag}.png")
     print(f"[{args.tag}] cls_mode={args.cls_mode} traj_mode={args.traj_mode} "
-          f"traj_loss={args.traj_loss} detach_anchor={args.detach_anchor} slot_feat={args.slot_feat}")
+          f"traj_loss={args.traj_loss} detach_anchor={args.detach_anchor} slot_feat={args.slot_feat} "
+          f"slot_anchor={args.slot_anchor}")
 
     # 可复现
     random.seed(SEED)
@@ -402,10 +457,10 @@ def main():
     model = MultiTaskConvLSTMv2(cls_mode=args.cls_mode, traj_mode=args.traj_mode,
                                 detach_anchor=args.detach_anchor, h1_ch=args.h1_ch,
                                 h2_ch=args.h2_ch, dec_hidden=args.dec_hidden,
-                                slot_feat=args.slot_feat).to(device)
+                                slot_feat=args.slot_feat, slot_anchor=args.slot_anchor).to(device)
     if args.init_from:
         init = torch.load(args.init_from, map_location=device, weights_only=True)
-        model.load_state_dict(init["model_state_dict"])
+        _load_weights_with_migration(model, init["model_state_dict"])
         print(f"已从 {args.init_from} 加载权重 (epoch {init['epoch']}, "
               f"val_ade {init['val_ade']:.2f}px) 继续训练")
     n_params = sum(p.numel() for p in model.parameters())
@@ -429,7 +484,8 @@ def main():
             centers_norm = centers / CANVAS
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                logits, traj, vel = model(video[:, :N_INPUT])
+                obs_centers = centers_norm[:, :N_INPUT] if args.slot_anchor else None
+                logits, traj, vel = model(video[:, :N_INPUT], obs_centers)
                 loss, l_cls, l_traj, l_anchor, l_vel = multitask_loss(
                     logits, traj, labels, centers_norm, args.traj_loss, vel,
                     cls_weight=args.cls_weight)
