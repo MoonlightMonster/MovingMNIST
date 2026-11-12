@@ -61,11 +61,6 @@ GRAD_CLIP = 1.0   # LSTM 训练必备, 防梯度爆炸
 VAL_SEED = 555    # 验证集固定 seed (调模型用)
 TEST_SEED = 2026  # 测试集固定 seed (与线性基线同一套, 直接对比)
 
-EMBED_DIM = 64    # 身份嵌入向量维度 (供后续数据关联用)
-L_EMBED = 0.3     # 嵌入损失权重 (track-identity 对比损失)
-SLOT_SEP_TARGET = -1.0  # 槽位区分目标: 同样本两槽位嵌入余弦相似度应趋近 -1 (不同物体)
-L_AGG = 0.1       # 类别内聚辅助损失权重 (弱权重, 主要靠槽位区分)
-
 
 # ---------------- 模型 ----------------
 class ConvLSTMCell(nn.Module):
@@ -128,13 +123,12 @@ class MultiTaskConvLSTMv2(nn.Module):
 
     def __init__(self, n_slots=N_SLOTS, n_classes=10, n_future=N_FUTURE, dec_hidden=512,
                  h1_ch=96, h2_ch=128, cls_mode="slot", traj_mode="delta", detach_anchor=False,
-                 slot_feat=False, slot_feat_dim=32, embed=False, embed_dim=EMBED_DIM):
+                 slot_feat=False, slot_feat_dim=32):
         super().__init__()
         assert cls_mode in ("gap", "slot", "clean") and traj_mode in ("abs", "delta")
         self.n_slots, self.n_future = n_slots, n_future
         self.cls_mode, self.traj_mode, self.detach_anchor = cls_mode, traj_mode, detach_anchor
         self.slot_feat = slot_feat
-        self.embed = embed
         self.encoder = SpatioTemporalEncoder(h1_ch, h2_ch)
 
         # 轨迹解码器
@@ -170,28 +164,12 @@ class MultiTaskConvLSTMv2(nn.Module):
                 nn.Linear(128, n_classes),
             )
 
-        # 身份嵌入头 (track identity): 输入"每槽位锚定位置的外观特征"(h1_ch 维),
-        # 输出每个槽位的身份向量. 修复 v1 的两个根因:
-        #   1) v1 用 h2 全局池化再 view(B,N,D) 硬切, 两槽位来自同一全局向量切片, 无物体语义 -> 坍塌
-        #   2) v1 triplet 把"数字类别相同"当"身份", 但类别≠身份
-        # 正确做法: 嵌入来自"该数字自身外观"(grid_sample 锚定位置), 语义是 track identity.
-        if embed:
-            self.embed_head = nn.Sequential(
-                nn.Linear(h1_ch, 128), nn.ReLU(), nn.Dropout(0.25),
-                nn.Linear(128, embed_dim),
-            )
-
     def forward(self, video):
         """video: (B,T,1,64,64) -> logits (B,N,10), traj (B,F+1,N,2), vel (B,N,2)|None.
         traj[:, 0] 是当前帧锚定位置, traj[:, 1:] 是未来 F 帧预测 (均为归一化坐标).
         vel 仅 cls_mode=clean 时输出: 锚定时刻的瞬时速度估计 (归一化坐标/帧)."""
         h1, h2, h1_seq = self.encoder(video)
         B = video.shape[0]
-
-        # 身份嵌入: 每个槽位一个 embed_dim 维向量, 来自"该数字锚定位置的外观特征".
-        # 注意: 锚定位置 traj[:,0] 在下方轨迹解码循环之后才算出, 所以嵌入在轨迹解码后计算.
-        # 这里先占位, 实际在 traj 计算完成后生成 (见 forward 末尾).
-        embed = None
 
         ctx = torch.tanh(self.ctx(h2.flatten(1)))
         h, c = torch.tanh(self.h0(ctx)), torch.tanh(self.c0(ctx))
@@ -244,18 +222,7 @@ class MultiTaskConvLSTMv2(nn.Module):
             local = (w.view(B, N_INPUT, 1, 1) * feat).sum(dim=1)      # (B,N,C1) 时间融合
             glob = h2.mean(dim=(2, 3)).unsqueeze(1).expand(-1, self.n_slots, -1)
             logits = self.cls_head(torch.cat([local, glob], dim=-1))  # (B,N,10)
-
-        # 身份嵌入: 用每个槽位的"锚定位置"(traj[:,0]) 在 h1 上 grid_sample 该数字的局部外观,
-        # 得到逐槽位的身份向量 (track identity). 锚定位置 detach 防梯度污染 (与 slot 分类头一致).
-        if self.embed:
-            anchor = traj[:, 0].detach()                        # (B,N,2) 归一化坐标
-            grid = (anchor * 2 - 1).view(B, self.n_slots, 1, 2)  # grid_sample 坐标 [-1,1]
-            local = F.grid_sample(h1, grid, mode="bilinear",
-                                  padding_mode="border", align_corners=False)  # (B,C1,N,1)
-            local = local.squeeze(-1).permute(0, 2, 1)          # (B,N,h1_ch)
-            embed = self.embed_head(local)                      # (B,N,embed_dim)
-
-        return logits, traj, vel, embed
+        return logits, traj, vel
 
 
 # ---------------- 目标构造与损失 ----------------
@@ -271,11 +238,9 @@ def sort_slots(labels, centers):
     return labels, centers
 
 
-def multitask_loss(logits, traj, labels, centers_norm, traj_loss, vel=None, cls_weight=1.0,
-                   embed=None):
+def multitask_loss(logits, traj, labels, centers_norm, traj_loss, vel=None, cls_weight=1.0):
     """logits (B,N,10), traj (B,F+1,N,2), labels (B,N), centers_norm (B,T,N,2),
-    vel (B,N,2)|None: clean 分类头的瞬时速度估计, 用真值末帧速度做辅助监督.
-    embed (B,N,D)|None: 身份嵌入 (track identity), 用对比损失让同样本两槽位区分开."""
+    vel (B,N,2)|None: clean 分类头的瞬时速度估计, 用真值末帧速度做辅助监督."""
     loss_cls = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
                                labels.reshape(-1), label_smoothing=LABEL_SMOOTHING)
     if traj_loss == "huber":
@@ -290,56 +255,7 @@ def multitask_loss(logits, traj, labels, centers_norm, traj_loss, vel=None, cls_
         vel_gt = centers_norm[:, N_INPUT - 1] - centers_norm[:, N_INPUT - 2]  # 末帧瞬时速度
         loss_vel = F.smooth_l1_loss(vel, vel_gt, beta=HUBER_BETA)
         total = total + L_VEL * loss_vel
-    loss_embed = logits.new_zeros(())
-    if embed is not None:
-        loss_embed, _, _ = embedding_loss(embed, labels)
-        total = total + L_EMBED * loss_embed
-    return (total, loss_cls.detach(), loss_traj.detach(), loss_anchor.detach(),
-            loss_vel.detach(), loss_embed.detach())
-
-
-def embedding_loss(embed, labels):
-    """track-identity 对比损失 (修复 v1 语义错误).
-
-    v1 错误: 把"数字类别相同"当"身份相同"(labs==labs 做正样本), 导致同类数字全部聚拢,
-    嵌入坍塌 (槽位相似度 0.991). 但类别≠身份: 两个"7"是不同物体, 身份应被区分.
-
-    v2 正确语义 (track identity):
-      1) 槽位区分 (核心): 同一样本内, 槽位 0 与槽位 1 的嵌入必须区分开 (不同物体),
-         即同一样本内两槽位嵌入的相似度应尽量低. 这是解决深度重叠身份交换的关键.
-      2) 类别内聚 (辅助): 同数字类别(跨样本)的嵌入应相近 (同一外观), 弱权重.
-
-    embed (B,N,D), labels (B,N) -> 标量损失.
-    返回: total, slot_sep, cls_agg (供诊断)."""
-    B, N, D = embed.shape
-    e = F.normalize(embed, dim=-1)                       # (B,N,D) L2 归一化
-
-    # 1) 槽位区分: 同一样本内两槽位的余弦相似度 (应趋近 -1/低)
-    if N == 2:
-        cos_slots = (e[:, 0] * e[:, 1]).sum(dim=-1)      # (B,)
-        # 拉低相似度: 让 cos -> -1 (不同物体应正交或相反)
-        loss_sep = (cos_slots - SLOT_SEP_TARGET).pow(2).mean()  # SLOT_SEP_TARGET=-1
-    else:
-        # 通用: 同样本内所有槽位对相似度都拉低
-        cos = torch.bmm(e, e.transpose(1, 2))            # (B,N,N)
-        mask = ~torch.eye(N, dtype=torch.bool, device=embed.device).unsqueeze(0)
-        loss_sep = (cos[mask] - SLOT_SEP_TARGET).pow(2).mean()
-
-    # 2) 类别内聚 (辅助, 弱权重): 同数字类别(跨样本/跨槽位)嵌入应相近
-    #    展平成 (B*N, D), 同类别视为正样本对
-    e_flat = e.reshape(B * N, D)
-    labs_flat = labels.reshape(B * N)
-    sim = torch.mm(e_flat, e_flat.t())                   # (BN,BN) 余弦相似度
-    same_cls = (labs_flat[:, None] == labs_flat[None, :]) & \
-               (torch.arange(B * N, device=embed.device)[:, None] !=
-                torch.arange(B * N, device=embed.device)[None, :])
-    if same_cls.any():
-        loss_agg = (1.0 - sim[same_cls]).mean()          # 同类相似度 -> 1
-    else:
-        loss_agg = e_flat.new_zeros(())
-
-    total = loss_sep + L_AGG * loss_agg
-    return total, loss_sep.detach(), loss_agg.detach()
+    return total, loss_cls.detach(), loss_traj.detach(), loss_anchor.detach(), loss_vel.detach()
 
 
 # ---------------- 评估 (与 v1 同口径) ----------------
@@ -357,7 +273,7 @@ def evaluate(model, loader, device, use_amp):
         labels, centers = sort_slots(labels, centers)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            logits, traj, _, _ = model(video[:, :N_INPUT])
+            logits, traj, _ = model(video[:, :N_INPUT])
 
         err = (traj[:, 1:].float() * CANVAS - centers[:, N_INPUT:]).norm(dim=-1)  # (B,F,N) 像素
         ade_sum += err.mean(dim=(1, 2)).sum().item()   # 每条序列先平均, 与基线同口径
@@ -386,7 +302,7 @@ def visualize(model, ds, device, path, n_samples=3):
         labels, centers = sort_slots(labels, centers)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            logits, traj, _, _ = model(video[:, :N_INPUT])
+            logits, traj, _ = model(video[:, :N_INPUT])
         pred = (traj[0, 1:].float() * CANVAS).cpu().numpy()     # (F,N,2)
         pred_cls = logits[0].argmax(-1).cpu().tolist()
         true_cls = labels[0].cpu().tolist()
@@ -425,8 +341,6 @@ def main():
                         help="slot 分类头取样时切断梯度, 防止分类损失带偏锚定位置")
     parser.add_argument("--slot-feat", action="store_true",
                         help="v4: 解码器每步喂槽位级外观特征 (grid_sample h1, 坐标detach)")
-    parser.add_argument("--embed", action="store_true",
-                        help="加身份嵌入头 (A方案): 输出每槽位身份向量, track-identity对比损失训练, 供数据关联")
     parser.add_argument("--h1-ch", type=int, default=96, help="ConvLSTM 第1层通道数")
     parser.add_argument("--h2-ch", type=int, default=128, help="ConvLSTM 第2层通道数")
     parser.add_argument("--dec-hidden", type=int, default=512, help="轨迹解码器隐层宽度")
@@ -455,8 +369,7 @@ def main():
     metrics_path = os.path.join(CKPT_DIR, f"convlstm_{args.tag}_metrics.json")
     fig_path = os.path.join(SAMPLE_DIR, f"traj_convlstm_{args.tag}.png")
     print(f"[{args.tag}] cls_mode={args.cls_mode} traj_mode={args.traj_mode} "
-          f"traj_loss={args.traj_loss} detach_anchor={args.detach_anchor} slot_feat={args.slot_feat} "
-          f"embed={args.embed}")
+          f"traj_loss={args.traj_loss} detach_anchor={args.detach_anchor} slot_feat={args.slot_feat}")
 
     # 可复现
     random.seed(SEED)
@@ -489,7 +402,7 @@ def main():
     model = MultiTaskConvLSTMv2(cls_mode=args.cls_mode, traj_mode=args.traj_mode,
                                 detach_anchor=args.detach_anchor, h1_ch=args.h1_ch,
                                 h2_ch=args.h2_ch, dec_hidden=args.dec_hidden,
-                                slot_feat=args.slot_feat, embed=args.embed).to(device)
+                                slot_feat=args.slot_feat).to(device)
     if args.init_from:
         init = torch.load(args.init_from, map_location=device, weights_only=True)
         model.load_state_dict(init["model_state_dict"])
@@ -507,7 +420,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
-        sums = np.zeros(6)  # total, cls, traj, anchor, vel, embed
+        sums = np.zeros(5)  # total, cls, traj, anchor, vel
         for batch in train_loader:
             video = batch["video"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
@@ -516,10 +429,10 @@ def main():
             centers_norm = centers / CANVAS
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                logits, traj, vel, embed = model(video[:, :N_INPUT])
-                loss, l_cls, l_traj, l_anchor, l_vel, l_embed = multitask_loss(
+                logits, traj, vel = model(video[:, :N_INPUT])
+                loss, l_cls, l_traj, l_anchor, l_vel = multitask_loss(
                     logits, traj, labels, centers_norm, args.traj_loss, vel,
-                    cls_weight=args.cls_weight, embed=embed)
+                    cls_weight=args.cls_weight)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -527,8 +440,7 @@ def main():
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             scaler.step(optimizer)
             scaler.update()
-            sums += [loss.item(), l_cls.item(), l_traj.item(), l_anchor.item(), l_vel.item(),
-                     l_embed.item()]
+            sums += [loss.item(), l_cls.item(), l_traj.item(), l_anchor.item(), l_vel.item()]
         scheduler.step()
 
         n_batch = len(train_loader)
@@ -543,7 +455,7 @@ def main():
             marker = "  <- best"
         print(f"epoch {epoch:2d}/{args.epochs}  loss {sums[0]/n_batch:.4f} "
               f"(cls {sums[1]/n_batch:.4f} traj {sums[2]/n_batch:.4f} anchor {sums[3]/n_batch:.4f} "
-              f"vel {sums[4]/n_batch:.4f} embed {sums[5]/n_batch:.4f})  "
+              f"vel {sums[4]/n_batch:.4f})  "
               f"val_ade {val_ade:.2f}px  val_fde {val_fde:.2f}px  val_acc {val_acc:.4f}  "
               f"({time.time()-t0:.1f}s){marker}")
 
