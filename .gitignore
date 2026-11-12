@@ -30,6 +30,7 @@ checkpoints/
 results/*
 !results/关联分析.md
 !results/交换根因定位与身份锚方案.md
+!results/成果报告.md
 samples/
 
 # ---- 环境 ----
