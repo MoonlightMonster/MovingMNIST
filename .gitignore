@@ -1,0 +1,41 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+
+# ---- 数据与模型产物（体积大，可再生成，不入库）----
+# 训练数据（MNIST 原始文件）
+dataset/data/
+
+# ---- 与项目无关的误放文件（数控课程作业、离子突触晶体管论文）----
+docs/数控加工中心复杂零件铣削加工课程心得*.docx
+docs/数控加工中心复杂零件铣削加工课程心得*.pdf
+docs/Sci Advances-*.pdf
+docs/decrypted_paper.pdf
+docs/paper_text.txt
+
+# 模型权重（最终模型如需分发，用 Git LFS / HuggingFace / Releases 单独管理）
+checkpoints/
+*.pth
+
+# 可视化与结果产物（本地生成，可选上传）
+results/
+samples/
+
+# ---- 环境 ----
+.venv/
+venv/
+env/
+*.log
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
