@@ -27,7 +27,8 @@ checkpoints/
 *.pth
 
 # 可视化与结果产物（本地生成，可选上传）
-results/
+results/*
+!results/关联分析.md
 samples/
 
 # ---- 环境 ----
