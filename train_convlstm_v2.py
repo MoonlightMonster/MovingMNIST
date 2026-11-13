@@ -123,13 +123,16 @@ class MultiTaskConvLSTMv2(nn.Module):
 
     def __init__(self, n_slots=N_SLOTS, n_classes=10, n_future=N_FUTURE, dec_hidden=512,
                  h1_ch=96, h2_ch=128, cls_mode="slot", traj_mode="delta", detach_anchor=False,
-                 slot_feat=False, slot_feat_dim=32, slot_anchor=False, anchor_dim=32):
+                 slot_feat=False, slot_feat_dim=32, slot_anchor=False, anchor_dim=32,
+                 pixel_head=False, sigma=0.06):
         super().__init__()
         assert cls_mode in ("gap", "slot", "clean") and traj_mode in ("abs", "delta")
         self.n_slots, self.n_future = n_slots, n_future
         self.cls_mode, self.traj_mode, self.detach_anchor = cls_mode, traj_mode, detach_anchor
         self.slot_feat = slot_feat
         self.slot_anchor = slot_anchor
+        self.pixel_head = pixel_head
+        self.sigma = sigma  # 高斯光斑标准差 (归一化坐标), 用于可微渲染
         self.encoder = SpatioTemporalEncoder(h1_ch, h2_ch)
 
         # 轨迹解码器
@@ -251,7 +254,32 @@ class MultiTaskConvLSTMv2(nn.Module):
             local = (w.view(B, N_INPUT, 1, 1) * feat).sum(dim=1)      # (B,N,C1) 时间融合
             glob = h2.mean(dim=(2, 3)).unsqueeze(1).expand(-1, self.n_slots, -1)
             logits = self.cls_head(torch.cat([local, glob], dim=-1))  # (B,N,10)
-        return logits, traj, vel
+
+        # 可微渲染: 把预测的轨迹坐标渲染成"位置热力图" (给机器用的像素级位置信息).
+        # 每个槽位用其预测位置画一个高斯光斑, 叠加得到 (B,F,1,64,64) 热力图.
+        # 与轨迹预测共享同一运动来源, 天然统一; 像素监督反向强化身份与运动.
+        heatmap = None
+        if self.pixel_head:
+            heatmap = self.render_heatmap(traj[:, 1:])  # 只渲染未来 F 帧 (B,F,1,H,W)
+        return logits, traj, vel, heatmap
+
+    def render_heatmap(self, pos, H=64, W=64):
+        """把归一化坐标 pos (B,F,N,2) 渲染成高斯光斑热力图 (B,F,1,H,W).
+
+        每个槽位 n 在位置 pos[:,:,n] 画一个高斯核, 所有槽位取 max 叠加.
+        纯可微运算 (无参数), 便于 ONNX/C++ 导出.
+        """
+        B, F, N, _ = pos.shape
+        dev, dt = pos.device, pos.dtype
+        yy, xx = torch.meshgrid(
+            torch.linspace(0, 1, H, device=dev, dtype=dt),
+            torch.linspace(0, 1, W, device=dev, dtype=dt), indexing="ij")
+        grid = torch.stack([xx, yy], dim=-1)              # (H,W,2)
+        # pos: (B,F,N,2) -> (B,F,N,1,1,2); grid: (1,1,1,H,W,2)
+        d = (pos[:, :, :, None, None, :] - grid[None, None, None])  # (B,F,N,H,W,2)
+        gauss = torch.exp(-(d.pow(2).sum(-1)) / (2 * self.sigma ** 2))  # (B,F,N,H,W)
+        heat = gauss.max(dim=2)[0]                        # (B,F,H,W) 槽位取 max
+        return heat.unsqueeze(2)                          # (B,F,1,H,W)
 
 
 # ---------------- 目标构造与损失 ----------------
@@ -288,9 +316,12 @@ def sort_slots(labels, centers):
     return labels, centers
 
 
-def multitask_loss(logits, traj, labels, centers_norm, traj_loss, vel=None, cls_weight=1.0):
+def multitask_loss(logits, traj, labels, centers_norm, traj_loss, vel=None, cls_weight=1.0,
+                   heatmap=None, pixel_weight=0.0, sigma=0.06):
     """logits (B,N,10), traj (B,F+1,N,2), labels (B,N), centers_norm (B,T,N,2),
-    vel (B,N,2)|None: clean 分类头的瞬时速度估计, 用真值末帧速度做辅助监督."""
+    vel (B,N,2)|None: clean 分类头的瞬时速度估计, 用真值末帧速度做辅助监督.
+    heatmap (B,F,1,H,W)|None: 可微渲染的预测热力图, 与真值坐标渲染的热力图做像素 MSE.
+    pixel_weight: 像素损失权重 (默认 0, 关闭时 heatmap 项不参与)."""
     loss_cls = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
                                labels.reshape(-1), label_smoothing=LABEL_SMOOTHING)
     if traj_loss == "huber":
@@ -305,7 +336,29 @@ def multitask_loss(logits, traj, labels, centers_norm, traj_loss, vel=None, cls_
         vel_gt = centers_norm[:, N_INPUT - 1] - centers_norm[:, N_INPUT - 2]  # 末帧瞬时速度
         loss_vel = F.smooth_l1_loss(vel, vel_gt, beta=HUBER_BETA)
         total = total + L_VEL * loss_vel
-    return total, loss_cls.detach(), loss_traj.detach(), loss_anchor.detach(), loss_vel.detach()
+
+    # 像素监督: 预测热力图 vs 真值坐标渲染的热力图 (同一高斯核, 只差坐标来源)
+    loss_pixel = logits.new_zeros(())
+    if heatmap is not None and pixel_weight > 0:
+        gt_heat = render_heatmap_static(centers_norm[:, N_INPUT:], sigma=sigma)
+        loss_pixel = F.mse_loss(heatmap, gt_heat)
+        total = total + pixel_weight * loss_pixel
+    return total, loss_cls.detach(), loss_traj.detach(), loss_anchor.detach(), loss_vel.detach(), loss_pixel.detach()
+
+
+def render_heatmap_static(pos, sigma=0.06, H=64, W=64):
+    """把真值坐标 pos (B,F,N,2) 渲染成高斯光斑热力图 (B,F,1,H,W), 供像素监督用.
+    与模型内的 render_heatmap 用相同的高斯核与 sigma, 保证口径一致."""
+    B, F, N, _ = pos.shape
+    dev, dt = pos.device, pos.dtype
+    yy, xx = torch.meshgrid(
+        torch.linspace(0, 1, H, device=dev, dtype=dt),
+        torch.linspace(0, 1, W, device=dev, dtype=dt), indexing="ij")
+    grid = torch.stack([xx, yy], dim=-1)
+    d = (pos[:, :, :, None, None, :] - grid[None, None, None])
+    gauss = torch.exp(-(d.pow(2).sum(-1)) / (2 * sigma ** 2))
+    heat = gauss.max(dim=2)[0]
+    return heat.unsqueeze(2)
 
 
 # ---------------- 评估 (与 v1 同口径) ----------------
@@ -324,7 +377,7 @@ def evaluate(model, loader, device, use_amp):
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             obs_centers = (centers[:, :N_INPUT] / CANVAS) if model.slot_anchor else None
-            logits, traj, _ = model(video[:, :N_INPUT], obs_centers)
+            logits, traj, _, _ = model(video[:, :N_INPUT], obs_centers)
 
         err = (traj[:, 1:].float() * CANVAS - centers[:, N_INPUT:]).norm(dim=-1)  # (B,F,N) 像素
         ade_sum += err.mean(dim=(1, 2)).sum().item()   # 每条序列先平均, 与基线同口径
@@ -354,7 +407,7 @@ def visualize(model, ds, device, path, n_samples=3):
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             obs_centers = (centers[:, :N_INPUT] / CANVAS) if model.slot_anchor else None
-            logits, traj, _ = model(video[:, :N_INPUT], obs_centers)
+            logits, traj, _, _ = model(video[:, :N_INPUT], obs_centers)
         pred = (traj[0, 1:].float() * CANVAS).cpu().numpy()     # (F,N,2)
         pred_cls = logits[0].argmax(-1).cpu().tolist()
         true_cls = labels[0].cpu().tolist()
@@ -395,6 +448,12 @@ def main():
                         help="v4: 解码器每步喂槽位级外观特征 (grid_sample h1, 坐标detach)")
     parser.add_argument("--slot-anchor", action="store_true",
                         help="v5: 解码器喂观测段'最清晰帧'的身份外观锚 (detach, 维持重叠时身份)")
+    parser.add_argument("--pixel-head", action="store_true",
+                        help="v6: 可微渲染像素头——把预测坐标渲染成位置热力图, 加像素MSE监督(给机器用)")
+    parser.add_argument("--pixel-weight", type=float, default=0.1,
+                        help="像素损失权重 (需配合 --pixel-head, 默认0.1)")
+    parser.add_argument("--pixel-sigma", type=float, default=0.06,
+                        help="渲染高斯光斑标准差 (归一化坐标, 0.06*64≈3.8px)")
     parser.add_argument("--h1-ch", type=int, default=96, help="ConvLSTM 第1层通道数")
     parser.add_argument("--h2-ch", type=int, default=128, help="ConvLSTM 第2层通道数")
     parser.add_argument("--dec-hidden", type=int, default=512, help="轨迹解码器隐层宽度")
@@ -424,7 +483,7 @@ def main():
     fig_path = os.path.join(SAMPLE_DIR, f"traj_convlstm_{args.tag}.png")
     print(f"[{args.tag}] cls_mode={args.cls_mode} traj_mode={args.traj_mode} "
           f"traj_loss={args.traj_loss} detach_anchor={args.detach_anchor} slot_feat={args.slot_feat} "
-          f"slot_anchor={args.slot_anchor}")
+          f"slot_anchor={args.slot_anchor} pixel_head={args.pixel_head}")
 
     # 可复现
     random.seed(SEED)
@@ -457,7 +516,8 @@ def main():
     model = MultiTaskConvLSTMv2(cls_mode=args.cls_mode, traj_mode=args.traj_mode,
                                 detach_anchor=args.detach_anchor, h1_ch=args.h1_ch,
                                 h2_ch=args.h2_ch, dec_hidden=args.dec_hidden,
-                                slot_feat=args.slot_feat, slot_anchor=args.slot_anchor).to(device)
+                                slot_feat=args.slot_feat, slot_anchor=args.slot_anchor,
+                                pixel_head=args.pixel_head, sigma=args.pixel_sigma).to(device)
     if args.init_from:
         init = torch.load(args.init_from, map_location=device, weights_only=True)
         _load_weights_with_migration(model, init["model_state_dict"])
@@ -475,7 +535,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
-        sums = np.zeros(5)  # total, cls, traj, anchor, vel
+        sums = np.zeros(6)  # total, cls, traj, anchor, vel, pixel
         for batch in train_loader:
             video = batch["video"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
@@ -485,10 +545,11 @@ def main():
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 obs_centers = centers_norm[:, :N_INPUT] if args.slot_anchor else None
-                logits, traj, vel = model(video[:, :N_INPUT], obs_centers)
-                loss, l_cls, l_traj, l_anchor, l_vel = multitask_loss(
+                logits, traj, vel, heatmap = model(video[:, :N_INPUT], obs_centers)
+                loss, l_cls, l_traj, l_anchor, l_vel, l_pixel = multitask_loss(
                     logits, traj, labels, centers_norm, args.traj_loss, vel,
-                    cls_weight=args.cls_weight)
+                    cls_weight=args.cls_weight, heatmap=heatmap,
+                    pixel_weight=args.pixel_weight, sigma=args.pixel_sigma)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -496,7 +557,7 @@ def main():
             nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             scaler.step(optimizer)
             scaler.update()
-            sums += [loss.item(), l_cls.item(), l_traj.item(), l_anchor.item(), l_vel.item()]
+            sums += [loss.item(), l_cls.item(), l_traj.item(), l_anchor.item(), l_vel.item(), l_pixel.item()]
         scheduler.step()
 
         n_batch = len(train_loader)
@@ -511,7 +572,7 @@ def main():
             marker = "  <- best"
         print(f"epoch {epoch:2d}/{args.epochs}  loss {sums[0]/n_batch:.4f} "
               f"(cls {sums[1]/n_batch:.4f} traj {sums[2]/n_batch:.4f} anchor {sums[3]/n_batch:.4f} "
-              f"vel {sums[4]/n_batch:.4f})  "
+              f"vel {sums[4]/n_batch:.4f} pixel {sums[5]/n_batch:.4f})  "
               f"val_ade {val_ade:.2f}px  val_fde {val_fde:.2f}px  val_acc {val_acc:.4f}  "
               f"({time.time()-t0:.1f}s){marker}")
 
