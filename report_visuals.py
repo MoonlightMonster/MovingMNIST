@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-CKPT_PATH = r"D:\MovingMNIST\checkpoints\convlstm_v5_anchor_best.pth"
+CKPT_PATH = r"D:\MovingMNIST\checkpoints\convlstm_v5_anchor_30ep_best.pth"
 DATA_ROOT = r"D:\MovingMNIST\dataset\data"
 FIG_DIR = r"D:\MovingMNIST\results\figs"
 TEST_SEED = 2026
@@ -67,7 +67,7 @@ def report_traj(model, device):
         labels, centers = sort_slots(labels, centers)
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             obs_centers = centers[:, :N_INPUT] / CANVAS
-            logits, traj, _ = model(video[:, :N_INPUT], obs_centers)
+            logits, traj, _, _ = model(video[:, :N_INPUT], obs_centers)
         pred = (traj[0, 1:].detach().float() * CANVAS).cpu().numpy()   # (F,N,2)
         centers = centers[0].cpu().numpy()
         video_np = video[0].cpu().numpy()
@@ -102,15 +102,15 @@ def report_traj(model, device):
 
 def report_progress():
     """图2: 各版本指标进步曲线."""
-    versions = ["v1", "v2a", "v3", "v4", "v4ft", "v5_anchor"]
-    ade = [7.81, 6.05, 6.02, 5.27, 5.25, 4.99]
-    fde = [9.98, 8.35, 8.30, 7.40, 7.28, 7.00]
-    acc = [95.6, 95.5, 96.8, 96.2, 96.5, 96.35]
+    versions = ["v1", "v2a", "v3", "v4", "v4ft", "v5_anchor", "v5_anchor\n(30ep)"]
+    ade = [7.81, 6.05, 6.02, 5.27, 5.25, 4.99, 4.44]
+    fde = [9.98, 8.35, 8.30, 7.40, 7.28, 7.00, 6.18]
+    acc = [95.6, 95.5, 96.8, 96.2, 96.5, 96.35, 96.50]
     baseline_ade = 23.88
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
     x = np.arange(len(versions))
-    colors = ["#b0b0b0", "#b0b0b0", "#7aa0d0", "#7aa0d0", "#4c7ac0", "#d43a3a"]
+    colors = ["#b0b0b0", "#b0b0b0", "#7aa0d0", "#7aa0d0", "#4c7ac0", "#d43a3a", "#a01818"]
 
     ax = axes[0]
     ax.axhline(baseline_ade, color="gray", ls="--", lw=1, label=f"线性基线 ADE={baseline_ade}")
@@ -128,7 +128,7 @@ def report_progress():
     ax = axes[1]
     ax.plot(x, acc, "o-", color="#2e8b57", lw=2, ms=8, label="分类准确率")
     ax.axhline(99.0, color="red", ls="--", lw=1, label="目标 99%")
-    ax.axhline(96.5, color="gray", ls=":", lw=1, label="当前 96.35%")
+    ax.axhline(96.5, color="gray", ls=":", lw=1, label="当前 96.50%")
     ax.set_xticks(x)
     ax.set_xticklabels(versions)
     ax.set_ylabel("分类准确率 (%)")
@@ -139,7 +139,7 @@ def report_progress():
     for xi, v in zip(x, acc):
         ax.text(xi, v + 1.2, f"{v:.1f}", ha="center", fontsize=9)
 
-    fig.suptitle("模型迭代成果：ADE 首次破 5.0，分类稳定 96%+", fontsize=15, y=1.02)
+    fig.suptitle("模型迭代成果：ADE 4.44（破 5.0 并持续下降），分类稳定 96%+", fontsize=15, y=1.02)
     fig.tight_layout()
     p = os.path.join(FIG_DIR, "report_progress.png")
     fig.savefig(p, dpi=150, bbox_inches="tight")
